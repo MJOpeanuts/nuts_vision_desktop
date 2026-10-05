@@ -11,6 +11,11 @@ from pathlib import Path
 from ultralytics import YOLO
 from typing import List, Tuple, Optional
 from PIL import Image, ImageOps
+
+try:
+    from .image_limits import open_image, InvalidImageError
+except ImportError:  # imported as a top-level module (src/ on sys.path)
+    from image_limits import open_image, InvalidImageError
 import json
 
 
@@ -34,7 +39,7 @@ def load_image_with_exif(image_path: str) -> np.ndarray:
         ValueError: If the image cannot be loaded.
     """
     try:
-        pil_img = Image.open(image_path)
+        pil_img = open_image(image_path)
         pil_img = ImageOps.exif_transpose(pil_img)
         # Ensure 3-channel RGB
         pil_img = pil_img.convert("RGB")
@@ -42,6 +47,8 @@ def load_image_with_exif(image_path: str) -> np.ndarray:
         rgb_array = np.array(pil_img)
         bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
         return bgr_array
+    except InvalidImageError:
+        raise  # clear user-facing message (too large / invalid image)
     except Exception as e:
         raise ValueError(f"Could not load image: {image_path} — {e}")
 

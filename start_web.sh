@@ -15,19 +15,22 @@ if [ ! -d "venv" ]; then
     echo ""
 fi
 
-# Activate virtual environment
-echo "Activating virtual environment..."
-source venv/bin/activate
+# Always use the venv's Python (never a global executable from PATH)
+VENV_PY="$(pwd)/venv/bin/python"
 
 # Install/update dependencies
 echo "Checking dependencies..."
-if pip install -q --timeout 30 -r requirements.txt; then
+if "$VENV_PY" -m pip install -q --timeout 30 -r requirements.txt; then
     echo "✅ Dependencies ready"
 else
     echo "⚠️  Failed to install dependencies (check your network connection)"
     echo "   If packages are already installed, the app may still work."
-    echo "   Run: pip install -r requirements.txt"
+    echo "   Run: $VENV_PY -m pip install -r requirements.txt"
 fi
+echo ""
+
+# ONNX must be present before starting: no install during analysis
+"$VENV_PY" check_onnx.py || exit 1
 echo ""
 
 # Set environment variables if .env exists
@@ -82,4 +85,4 @@ echo ""
 echo "Press Ctrl+C to stop the server"
 echo ""
 
-streamlit run app.py --server.port "$STREAMLIT_PORT" --server.address localhost
+"$VENV_PY" -m streamlit run app.py --server.port "$STREAMLIT_PORT" --server.address localhost

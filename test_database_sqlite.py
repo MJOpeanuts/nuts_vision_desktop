@@ -1,5 +1,7 @@
 """Tests for the local SQLite storage."""
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -33,3 +35,39 @@ def test_pcba_roundtrip(tmp_path):
     assert db.get_all_pcba_imports()[0]["detection_config"] == {"conf": 0.3}
     assert db.get_pcba_import_rows(imp)[0]["bounding_box"] == {"x": 1, "y": 2}
     assert db.get_pcba_statistics()["component_counts"] == {"IC": 1}
+
+
+def test_analysis_states_and_error(tmp_path):
+    db = DatabaseManager(tmp_path / "s.sqlite3")
+    image_id = db.log_image_upload("a.jpg", "/tmp/a.jpg", "jpg")
+    job_id = db.start_job(image_id, "m.pt", source_path="/tmp/a.jpg")
+    assert db.get_all_jobs()[0]["status"] == "processing"
+    db.end_job(job_id, "error", "ImageTooLargeError: too big")
+    row = db.get_all_jobs()[0]
+    assert row["status"] == "error" and "too big" in row["error_message"]
+    db.set_job_files(job_id, "n", "/f", "/f/input.jpg", "/f/result.jpg", "/f/metadata.json")
+    row = db.get_all_jobs()[0]
+    assert row["result_image_path"] == "/f/result.jpg" and row["source_path"] == "/tmp/a.jpg"
+    with pytest.raises(ValueError):
+        db.end_job(job_id, "weird")
+
+
+def test_three_central_tables_and_idempotent_init(tmp_path):
+    db = DatabaseManager(tmp_path / "t.sqlite3")
+    db.init_schema()
+    db.init_schema()
+    with db.get_connection() as conn:
+        names = {r[0] for r in conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"analyses", "detections", "crops"} <= names
+
+
+def test_default_path_from_localappdata(tmp_path, monkeypatch):
+    monkeypatch.delenv("NUTS_VISION_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    from config import get_paths
+    p = get_paths().database_path
+    assert p.name == "nuts_vision.sqlite3" and p.parent.name == "database"
+    assert "NutsVision" in p.parts and "DataPeanuts" in p.parts
+    db = DatabaseManager()
+    assert db.db_path.exists()

@@ -28,6 +28,7 @@ try:
     from config import get_paths, open_folder
     from database import get_db_manager_from_env
     from pipeline import ComponentAnalysisPipeline
+    from image_limits import open_image, InvalidImageError
     DB_AVAILABLE = True
 except ImportError as e:
     st.error(f"Error importing modules: {e}")
@@ -329,8 +330,12 @@ elif page == "\U0001f4e4 Upload & Process":
         cols = st.columns(min(3, len(uploaded_files)))
         for idx, uploaded_file in enumerate(uploaded_files[:6]):
             with cols[idx % 3]:
-                _preview = Image.open(uploaded_file)
-                _preview = ImageOps.exif_transpose(_preview)
+                try:
+                    _preview = open_image(uploaded_file)
+                    _preview = ImageOps.exif_transpose(_preview)
+                except InvalidImageError as e:
+                    st.error(f"\u274c {uploaded_file.name}: {e}")
+                    continue
                 st.image(_preview, caption=uploaded_file.name, width="stretch")
 
 
@@ -431,7 +436,11 @@ elif page == "\U0001f4f7 PCBA Photo Booth":
 
     img_bytes = st.session_state["pb_image_bytes"]
     img_name  = st.session_state["pb_image_name"]
-    pil_image = Image.open(io.BytesIO(img_bytes))
+    try:
+        pil_image = open_image(io.BytesIO(img_bytes))
+    except InvalidImageError as e:
+        st.error(f"\u274c {img_name}: {e}")
+        st.stop()
     # Apply EXIF orientation so the displayed image matches what the
     # detection pipeline sees (OpenCV ignores EXIF tags).
     pil_image = ImageOps.exif_transpose(pil_image)
@@ -763,7 +772,7 @@ elif page == "\U0001f4f7 PCBA Photo Booth":
                 # Display crop thumbnail
                 with col_imgs[col_idx % 4]:
                     st.image(
-                        Image.open(io.BytesIO(cv2.imencode(".jpg", crop)[1].tobytes())),
+                        open_image(io.BytesIO(cv2.imencode(".jpg", crop)[1].tobytes())),
                         caption=f"{cls} ({row['ic_subtype'] or '—'})",
                         width="stretch"
                     )
@@ -900,7 +909,7 @@ elif page == "\U0001f50d Job Viewer":
                 input_photos = list(job_dir.glob("input.*"))
                 if input_photos:
                     try:
-                        st.image(Image.open(input_photos[0]), caption="Input", width="stretch")
+                        st.image(open_image(input_photos[0]), caption="Input", width="stretch")
                     except Exception as e:
                         st.error(f"Could not display input photo: {e}")
                 else:
@@ -911,7 +920,7 @@ elif page == "\U0001f50d Job Viewer":
                 result_photo = job_dir / "result.jpg"
                 if result_photo.exists():
                     try:
-                        st.image(Image.open(result_photo), caption="Detected components", width="stretch")
+                        st.image(open_image(result_photo), caption="Detected components", width="stretch")
                     except Exception as e:
                         st.error(f"Could not display result photo: {e}")
                 else:
@@ -936,7 +945,7 @@ elif page == "\U0001f50d Job Viewer":
                                     caption = det.get("class_name", crop_file.stem)
                                     if "confidence" in det:
                                         caption += f" ({det['confidence']:.2f})"
-                                    st.image(Image.open(crop_file), caption=caption, width="stretch")
+                                    st.image(open_image(crop_file), caption=caption, width="stretch")
                                 except Exception as e:
                                     st.error(f"Error: {e}")
                 else:

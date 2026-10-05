@@ -1,51 +1,48 @@
 @echo off
 REM Startup script for nuts_vision web interface (Windows)
+REM Always uses the Python of the local virtual environment (venv), never a global one.
 
 echo ==========================================
 echo nuts_vision - Web Interface Launcher
 echo ==========================================
 echo.
 
-REM Check if virtual environment exists
-if not exist "venv" (
-    echo Virtual environment not found
-    echo Creating virtual environment...
+set "VENV_PY=%~dp0venv\Scripts\python.exe"
+cd /d "%~dp0"
+
+if not exist "%VENV_PY%" (
+    echo Virtual environment not found, creating it...
     python -m venv venv
-    echo Virtual environment created
-    echo.
+    if errorlevel 1 (
+        echo ERROR: could not create the virtual environment. Install Python 3.12 and retry.
+        pause
+        exit /b 1
+    )
 )
 
-REM Activate virtual environment
-echo Activating virtual environment...
-call venv\Scripts\activate.bat
-
-REM Install/update dependencies
-echo Checking dependencies...
-pip install -q --timeout 30 -r requirements.txt
-if %ERRORLEVEL% EQU 0 (
-    echo Dependencies ready
-) else (
+echo Installing dependencies with %VENV_PY% ...
+"%VENV_PY%" -m pip install -q --timeout 30 -r requirements.txt
+if errorlevel 1 (
     echo WARNING: Failed to install dependencies ^(check your network connection^)
-    echo If packages are already installed, the app may still work.
-    echo Run: pip install -r requirements.txt
+    echo Manual command: "%VENV_PY%" -m pip install -r requirements.txt
 )
 echo.
 
-REM Set environment variables if .env exists
+REM ONNX must be present before starting: no install during analysis
+"%VENV_PY%" check_onnx.py
+if errorlevel 1 (
+    pause
+    exit /b 1
+)
+echo.
+
+REM Optional .env (not required)
 if exist ".env" (
-    echo Loading environment variables from .env...
     for /f "tokens=*" %%a in ('type .env ^| findstr /v "^#"') do set %%a
-    echo Environment loaded
-) else (
-    echo No .env file found, using defaults
-    echo Create a .env file based on .env.example for custom configuration
 )
-echo.
 
-REM Set default port if not configured
 if not defined STREAMLIT_PORT set STREAMLIT_PORT=8501
 
-REM Check if the port is available, try up to 10 consecutive ports
 set /a MAX_ATTEMPTS=10
 set /a ATTEMPT=0
 
@@ -57,22 +54,17 @@ if %ERRORLEVEL% EQU 0 (
     set /a ATTEMPT+=1
     if %ATTEMPT% LSS %MAX_ATTEMPTS% goto check_port
     echo ERROR: Could not find an available port after %MAX_ATTEMPTS% attempts.
-    echo Please free port 8501 or set STREAMLIT_PORT in your .env file.
     pause
     exit /b 1
 )
 
-REM Launch Streamlit app
 echo ==========================================
 echo Starting nuts_vision Web Interface...
 echo ==========================================
-echo.
-echo The application will open in your browser at:
 echo http://localhost:%STREAMLIT_PORT%
-echo.
 echo Press Ctrl+C to stop the server
 echo.
 
-streamlit run app.py --server.port %STREAMLIT_PORT% --server.address localhost
+"%VENV_PY%" -m streamlit run app.py --server.port %STREAMLIT_PORT% --server.address localhost
 
 pause

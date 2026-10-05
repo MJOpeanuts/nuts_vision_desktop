@@ -73,12 +73,16 @@ jobs/
 
 ## Installation
 
-**Requirements:** Python 3.8+.
+**Requirements:** Python 3.12 recommended. No database server and no `.env` are needed:
+results are stored in SQLite at `%LOCALAPPDATA%\DataPeanuts\NutsVision\database\nuts_vision.sqlite3`.
 
-```bash
-# Install Python dependencies
-pip install -r requirements.txt
-```
+**Windows (install / restart):** just run `start_web.bat`. It creates `venv` if needed, installs
+`requirements.txt` (including `onnx` and `onnxruntime`) with `venv\Scripts\python.exe`, checks the
+ONNX imports, then starts Streamlit with that same Python. To restart, close the window and run it again.
+Manual install: `venv\Scripts\python.exe -m pip install -r requirements.txt`.
+
+**Image size limit:** 120 000 000 pixels by default (108 MP accepted); override with
+`NUTS_VISION_MAX_IMAGE_PIXELS`. Larger images are refused from their header, before decoding.
 
 ---
 
@@ -89,8 +93,8 @@ pip install -r requirements.txt
 bash start_web.sh          # Linux / macOS
 start_web.bat              # Windows
 
-# Or launch directly
-streamlit run app.py
+# Or launch directly (with the venv's Python)
+venv/bin/python -m streamlit run app.py   # Windows: venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 Open your browser at **http://localhost:8501**.

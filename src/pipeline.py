@@ -85,6 +85,36 @@ class ComponentAnalysisPipeline:
             Dictionary with job_folder, job_name, detections, crop_paths
         """
         img_path = Path(image_path)
+        job_id = self._db_start(img_path)
+        try:
+            result = self._process_image(img_path, jobs_base_dir, job_id)
+        except Exception as e:
+            self._db_end(job_id, "error", f"{type(e).__name__}: {e}")
+            raise
+        return result
+
+    def _db_start(self, img_path: Path):
+        """Create the image row and a 'processing' analysis (None if DB disabled)."""
+        if not self.use_database:
+            return None
+        try:
+            image_id = self.db.log_image_upload(
+                img_path.name, str(img_path.resolve()), img_path.suffix.lstrip("."))
+            return self.db.start_job(
+                image_id, str(self.model_path), source_path=str(img_path.resolve()))
+        except Exception as e:
+            print(f"Warning: Database logging failed: {e}")
+            return None
+
+    def _db_end(self, job_id, status: str, error: str = None):
+        if job_id is None:
+            return
+        try:
+            self.db.end_job(job_id, status, error)
+        except Exception as e:
+            print(f"Warning: Database logging failed: {e}")
+
+    def _process_image(self, img_path: Path, jobs_base_dir: str, job_id) -> dict:
         now = datetime.now()
         job_name = f"{img_path.stem}_{now.strftime('%Y%m%d_%H%M%S')}"
         job_dir = Path(jobs_base_dir) / job_name
@@ -156,25 +186,25 @@ class ComponentAnalysisPipeline:
         print(f"  Saved metadata: {metadata_path}")
 
         # --- Database logging ---
-        if self.use_database:
+        if job_id is not None:
             try:
-                file_fmt = img_path.suffix.lstrip(".")
-                image_id = self.db.log_image_upload(img_path.name, str(img_path.resolve()), file_fmt)
-                job_id = self.db.start_job(
-                    image_id, self.model_path,
-                    job_name=job_name,
-                    job_folder_path=str(job_dir.resolve())
-                )
+                self.db.set_job_files(
+                    job_id, job_name=job_name, job_folder_path=str(job_dir.resolve()),
+                    input_copy_path=str(input_copy.resolve()),
+                    result_image_path=str(result_path.resolve()),
+                    metadata_path=str(metadata_path.resolve()))
                 detection_ids = {}
                 for i, d in enumerate(detections):
-                    det_id = self.db.log_detection(job_id, d["class_name"], d["confidence"], d["bbox"])
-                    detection_ids[i] = det_id
+                    detection_ids[i] = self.db.log_detection(
+                        job_id, d["class_name"], d["confidence"], d["bbox"])
                 for i, crop_path in enumerate(crop_paths):
-                    if i in detection_ids:
-                        self.db.log_cropped_component(job_id, detection_ids[i], str(Path(crop_path).resolve()))
-                self.db.end_job(job_id)
+                    self.db.log_cropped_component(job_id, detection_ids[i],
+                                                  str(Path(crop_path).resolve()))
             except Exception as e:
+                self._db_end(job_id, "error", f"Database logging failed: {e}")
                 print(f"Warning: Database logging failed: {e}")
+            else:
+                self._db_end(job_id, "completed")
 
         print(f"\n✅ Job complete: {job_dir}")
         return {
