@@ -22,7 +22,8 @@ def check_python_packages():
 
     web_packages = [
         'streamlit',
-        'psycopg2'  # Installed as psycopg2-binary, imported as psycopg2
+        'sqlalchemy',
+        'alembic'
     ]
 
     missing = []
@@ -78,7 +79,7 @@ def main():
         for pkg in web_missing:
             print(f"   - {pkg}")
         print("\nTo install web interface packages, run:")
-        print("   pip install streamlit psycopg2-binary")
+        print("   pip install streamlit sqlalchemy alembic")
     else:
         print("\n✓ All web interface packages installed!")
 
@@ -87,7 +88,7 @@ def main():
         return 1
     elif web_missing:
         print("\n⚠ Core dependencies satisfied, but web interface packages are missing.")
-        print("Install them to use the web interface: pip install streamlit psycopg2-binary")
+        print("Install them to use the web interface: pip install streamlit sqlalchemy alembic")
         return 0
     else:
         print("\n✓ All dependencies satisfied! You're ready to use nuts_vision.")

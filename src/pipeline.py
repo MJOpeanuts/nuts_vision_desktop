@@ -23,7 +23,7 @@ try:
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
-    print("Warning: Database module not available. Install psycopg2 to enable database logging.")
+    print("Warning: Database module not available. Install sqlalchemy and alembic to enable database logging.")
 
 
 class ComponentAnalysisPipeline:
@@ -54,7 +54,7 @@ class ComponentAnalysisPipeline:
             try:
                 self.db = get_db_manager_from_env()
                 if not self.db.test_connection():
-                    print("Warning: Database connection failed. Continuing without database logging.")
+                    print("Warning: Local database unavailable. Continuing without database logging.")
                     self.use_database = False
             except Exception as e:
                 print(f"Warning: Could not initialize database: {e}")
@@ -238,7 +238,7 @@ Examples:
     parser.add_argument("--output-dir", type=str, default="jobs", help="Base directory for job folders (default: jobs)")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25)")
     parser.add_argument("--padding", type=int, default=10, help="Padding around crops in pixels (default: 10)")
-    parser.add_argument("--use-database", action="store_true", help="Enable database logging (requires PostgreSQL)")
+    parser.add_argument("--use-database", action="store_true", help="Enable logging to the local SQLite database")
 
     args = parser.parse_args()
 

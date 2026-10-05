@@ -11,8 +11,9 @@ numpy>=1.24.0
 # Data Management
 pandas>=2.0.0
 
-# Database (optional)
-psycopg2-binary>=2.9.0
+# Local database (SQLite)
+sqlalchemy>=2.0
+alembic>=1.13
 
 # Visualization
 matplotlib>=3.7.0

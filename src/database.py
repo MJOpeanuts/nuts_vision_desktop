@@ -1,373 +1,248 @@
 #!/usr/bin/env python3
 """
-Database utilities for nuts_vision
-Manages PostgreSQL database connections and logging operations.
+Database utilities for nuts_vision.
+
+Local SQLite storage (SQLAlchemy 2) with an Alembic-managed schema.
+Public methods keep the signatures and return formats of the former
+PostgreSQL implementation.
+
+Every operation uses its own short transaction and its own connection, so no
+transaction stays open during inference or image writing and nothing is shared
+between threads.
 """
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import threading
+import uuid
 from contextlib import contextmanager
-from typing import Optional, Dict, List, Any
-import os
-from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
+
+try:
+    from .config import get_paths
+except ImportError:  # imported as a top-level module (src/ on sys.path)
+    from config import get_paths
+
+BUSY_TIMEOUT_MS = 5000
+_ALEMBIC_DIR = Path(__file__).resolve().parent.parent / "alembic"
+_init_lock = threading.Lock()
+
+
+def _set_sqlite_pragmas(dbapi_conn, _record):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    try:
+        cur.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass  # e.g. filesystem not supporting WAL: keep default journal
+    cur.close()
+
+
+def _rows(result) -> List[Dict[str, Any]]:
+    return [dict(r) for r in result.mappings().all()]
 
 
 class DatabaseManager:
-    """Manages database connections and operations for nuts_vision."""
-    
-    def __init__(
-        self,
-        host: str = "localhost",
-        port: int = 5432,
-        database: str = "nuts_vision",
-        user: str = "nuts_user",
-        password: str = "nuts_password"
-    ):
+    """Manages the local SQLite database for nuts_vision."""
+
+    def __init__(self, db_path: "str | Path | None" = None, auto_init: bool = True):
         """
-        Initialize database manager.
-        
         Args:
-            host: Database host
-            port: Database port
-            database: Database name
-            user: Database user
-            password: Database password
+            db_path: SQLite file (default: <data dir>/database/nuts_vision.sqlite3)
+            auto_init: create folders/database and upgrade the schema
         """
-        self.connection_params = {
-            'host': host,
-            'port': port,
-            'database': database,
-            'user': user,
-            'password': password
-        }
-        
+        self.db_path = Path(db_path) if db_path else get_paths().database_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine: Engine = create_engine(
+            f"sqlite:///{self.db_path.as_posix()}",
+            connect_args={"timeout": BUSY_TIMEOUT_MS / 1000},
+        )
+        event.listen(self.engine, "connect", _set_sqlite_pragmas)
+        if auto_init:
+            self.init_schema()
+
+    def init_schema(self) -> None:
+        """Create or upgrade the schema (never resets existing data)."""
+        from alembic import command
+        from alembic.config import Config
+
+        cfg = Config()
+        cfg.set_main_option("script_location", str(_ALEMBIC_DIR))
+        cfg.set_main_option("sqlalchemy.url", self.engine.url.render_as_string(hide_password=False).replace("%", "%%"))
+        with _init_lock:  # safe against Streamlit reruns / threads
+            with self.engine.begin() as conn:
+                cfg.attributes["connection"] = conn
+                command.upgrade(cfg, "head")
+
     @contextmanager
     def get_connection(self):
-        """Get a database connection context manager."""
-        conn = psycopg2.connect(**self.connection_params)
-        try:
+        """Short transaction: commits on success, rolls back on error."""
+        with self.engine.begin() as conn:
             yield conn
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            conn.close()
-    
-    def log_image_upload(
-        self,
-        file_name: str,
-        file_path: str,
-        format: str = None
-    ) -> int:
-        """
-        Log an uploaded image to the database.
-        
-        Args:
-            file_name: Name of the image file
-            file_path: Full path to the image file
-            format: Image format (e.g., 'jpg', 'png')
-            
-        Returns:
-            image_id of the inserted record
-        """
+
+    # ------------------------------------------------------------------
+    # Images / jobs / detections
+    # ------------------------------------------------------------------
+
+    def log_image_upload(self, file_name: str, file_path: str, format: str = None) -> int:
+        """Log an uploaded image. Returns image_id."""
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO images_input (file_name, file_path, format)
-                    VALUES (%s, %s, %s)
-                    RETURNING image_id
-                    """,
-                    (file_name, file_path, format)
-                )
-                image_id = cursor.fetchone()[0]
-                return image_id
-    
+            res = conn.execute(
+                text("INSERT INTO images_input (file_name, file_path, format) "
+                     "VALUES (:n, :p, :f)"),
+                {"n": file_name, "p": file_path, "f": format},
+            )
+            return int(res.lastrowid)
+
     def start_job(
         self,
         image_id: int,
         model: str,
         job_name: str = None,
-        job_folder_path: str = None
+        job_folder_path: str = None,
+        model_version: str = None,
     ) -> int:
-        """
-        Start a detection job.
-        
-        Args:
-            image_id: ID of the image being processed
-            model: Model name/path used for detection
-            job_name: Human-readable job name (input_filename_date_time)
-            job_folder_path: Path to the job output folder
-            
-        Returns:
-            job_id of the created job
-        """
+        """Start a detection job (status 'running'). Returns job_id."""
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO log_jobs (image_id, model, job_name, job_folder_path)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING job_id
-                    """,
-                    (image_id, model, job_name, job_folder_path)
-                )
-                job_id = cursor.fetchone()[0]
-                return job_id
-    
-    def end_job(self, job_id: int):
-        """
-        Mark a job as ended.
-        
-        Args:
-            job_id: ID of the job to end
-        """
+            res = conn.execute(
+                text("INSERT INTO log_jobs (image_id, model, model_version, job_name, "
+                     "job_folder_path, status) "
+                     "VALUES (:i, :m, :mv, :jn, :jp, 'running')"),
+                {"i": image_id, "m": model, "mv": model_version,
+                 "jn": job_name, "jp": job_folder_path},
+            )
+            return int(res.lastrowid)
+
+    def end_job(self, job_id: int, status: str = "completed", error_message: str = None):
+        """Mark a job as ended ('completed' or 'error')."""
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE log_jobs
-                    SET ended_at = CURRENT_TIMESTAMP
-                    WHERE job_id = %s
-                    """,
-                    (job_id,)
-                )
-    
-    def log_detection(
-        self,
-        job_id: int,
-        class_name: str,
-        confidence: float,
-        bbox: List[float]
-    ) -> int:
-        """
-        Log a detection result.
-        
-        Args:
-            job_id: ID of the job
-            class_name: Detected component class
-            confidence: Detection confidence score
-            bbox: Bounding box coordinates [x1, y1, x2, y2]
-            
-        Returns:
-            detection_id of the inserted record
-        """
+            conn.execute(
+                text("UPDATE log_jobs SET ended_at = CURRENT_TIMESTAMP, status = :s, "
+                     "error_message = :e WHERE job_id = :j"),
+                {"s": status, "e": error_message, "j": job_id},
+            )
+
+    def log_detection(self, job_id: int, class_name: str, confidence: float,
+                      bbox: List[float]) -> int:
+        """Log a detection (bbox = [x1, y1, x2, y2]). Returns detection_id."""
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO detections 
-                    (job_id, class_name, confidence, bbox_x1, bbox_y1, bbox_x2, bbox_y2)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING detection_id
-                    """,
-                    (job_id, class_name, confidence, bbox[0], bbox[1], bbox[2], bbox[3])
-                )
-                detection_id = cursor.fetchone()[0]
-                return detection_id
-    
-    def log_cropped_component(
-        self,
-        job_id: int,
-        detection_id: int,
-        cropped_file_path: str
-    ) -> int:
-        """
-        Log a cropped component image.
-        
-        Args:
-            job_id: ID of the job
-            detection_id: ID of the detection
-            cropped_file_path: Path to the cropped image
-            
-        Returns:
-            cropped_id of the inserted record
-        """
+            res = conn.execute(
+                text("INSERT INTO detections (job_id, class_name, confidence, "
+                     "bbox_x1, bbox_y1, bbox_x2, bbox_y2) "
+                     "VALUES (:j, :c, :conf, :x1, :y1, :x2, :y2)"),
+                {"j": job_id, "c": class_name, "conf": float(confidence),
+                 "x1": float(bbox[0]), "y1": float(bbox[1]),
+                 "x2": float(bbox[2]), "y2": float(bbox[3])},
+            )
+            return int(res.lastrowid)
+
+    def log_cropped_component(self, job_id: int, detection_id: int,
+                              cropped_file_path: str) -> int:
+        """Log a cropped component image. Returns cropped_id."""
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO ics_cropped (job_id, detection_id, cropped_file_path)
-                    VALUES (%s, %s, %s)
-                    RETURNING cropped_id
-                    """,
-                    (job_id, detection_id, cropped_file_path)
-                )
-                cropped_id = cursor.fetchone()[0]
-                return cropped_id
-    
+            res = conn.execute(
+                text("INSERT INTO ics_cropped (job_id, detection_id, cropped_file_path) "
+                     "VALUES (:j, :d, :p)"),
+                {"j": job_id, "d": detection_id, "p": cropped_file_path},
+            )
+            return int(res.lastrowid)
+
     def get_job_statistics(self, job_id: int) -> Dict[str, Any]:
-        """
-        Get statistics for a specific job.
-        
-        Args:
-            job_id: ID of the job
-            
-        Returns:
-            Dictionary with job statistics
-        """
+        """Statistics for a specific job."""
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT 
-                        j.*,
-                        i.file_name,
-                        i.file_path,
-                        COUNT(DISTINCT d.detection_id) as total_detections,
-                        COUNT(DISTINCT ic.cropped_id) as total_crops
+            res = conn.execute(
+                text("""
+                    SELECT j.*, i.file_name, i.file_path,
+                        COUNT(DISTINCT d.detection_id) AS total_detections,
+                        COUNT(DISTINCT ic.cropped_id) AS total_crops
                     FROM log_jobs j
                     JOIN images_input i ON j.image_id = i.image_id
                     LEFT JOIN detections d ON j.job_id = d.job_id
                     LEFT JOIN ics_cropped ic ON j.job_id = ic.job_id
-                    WHERE j.job_id = %s
+                    WHERE j.job_id = :j
                     GROUP BY j.job_id, i.file_name, i.file_path
-                    """,
-                    (job_id,)
-                )
-                stats = cursor.fetchone()
-                return dict(stats) if stats else {}
-    
+                """),
+                {"j": job_id},
+            )
+            rows = _rows(res)
+            return rows[0] if rows else {}
+
     def test_connection(self) -> bool:
-        """
-        Test database connection.
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
+        """Return True if the database is reachable."""
         try:
             with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT 1")
-                    return True
+                conn.execute(text("SELECT 1"))
+            return True
         except Exception as e:
             print(f"Database connection failed: {e}")
             return False
-    
+
     def get_all_images(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get all uploaded images.
-        
-        Args:
-            limit: Maximum number of records to return
-            
-        Returns:
-            List of image records
-        """
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT * FROM images_input
-                    ORDER BY upload_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,)
-                )
-                return [dict(row) for row in cursor.fetchall()]
-    
+            return _rows(conn.execute(
+                text("SELECT * FROM images_input ORDER BY upload_at DESC, image_id DESC "
+                     "LIMIT :l"), {"l": limit}))
+
     def get_all_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get all jobs with image information.
-        
-        Args:
-            limit: Maximum number of records to return
-            
-        Returns:
-            List of job records
-        """
+        """All jobs (most recent first) with image information."""
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT 
-                        j.*,
-                        i.file_name,
-                        i.file_path,
-                        i.format,
-                        COUNT(DISTINCT d.detection_id) as detection_count
+            return _rows(conn.execute(
+                text("""
+                    SELECT j.*, i.file_name, i.file_path, i.format,
+                        COUNT(DISTINCT d.detection_id) AS detection_count
                     FROM log_jobs j
                     JOIN images_input i ON j.image_id = i.image_id
                     LEFT JOIN detections d ON j.job_id = d.job_id
                     GROUP BY j.job_id, i.file_name, i.file_path, i.format
-                    ORDER BY j.started_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,)
-                )
-                return [dict(row) for row in cursor.fetchall()]
-    
+                    ORDER BY j.started_at DESC, j.job_id DESC
+                    LIMIT :l
+                """), {"l": limit}))
+
     def get_all_detections(self, job_id: int = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get all detections, optionally filtered by job.
-        
-        Args:
-            job_id: Optional job ID to filter by
-            limit: Maximum number of records to return
-            
-        Returns:
-            List of detection records
-        """
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                if job_id:
-                    cursor.execute(
-                        """
-                        SELECT * FROM detections
-                        WHERE job_id = %s
-                        ORDER BY detection_id DESC
-                        LIMIT %s
-                        """,
-                        (job_id, limit)
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        SELECT * FROM detections
-                        ORDER BY detection_id DESC
-                        LIMIT %s
-                        """,
-                        (limit,)
-                    )
-                return [dict(row) for row in cursor.fetchall()]
-    
+            if job_id:
+                res = conn.execute(
+                    text("SELECT * FROM detections WHERE job_id = :j "
+                         "ORDER BY detection_id DESC LIMIT :l"),
+                    {"j": job_id, "l": limit})
+            else:
+                res = conn.execute(
+                    text("SELECT * FROM detections ORDER BY detection_id DESC LIMIT :l"),
+                    {"l": limit})
+            return _rows(res)
+
+    def get_all_cropped_components(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            return _rows(conn.execute(
+                text("""
+                    SELECT ic.*, d.class_name, j.job_name
+                    FROM ics_cropped ic
+                    JOIN detections d ON ic.detection_id = d.detection_id
+                    JOIN log_jobs j ON ic.job_id = j.job_id
+                    ORDER BY ic.created_at DESC, ic.cropped_id DESC LIMIT :l
+                """), {"l": limit}))
+
     def get_detection_statistics(self) -> Dict[str, Any]:
-        """
-        Get overall detection statistics.
-        
-        Returns:
-            Dictionary with statistics
-        """
+        """Overall detection statistics."""
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT 
-                        COUNT(DISTINCT i.image_id) as total_images,
-                        COUNT(DISTINCT j.job_id) as total_jobs,
-                        COUNT(DISTINCT d.detection_id) as total_detections
-                    FROM images_input i
-                    LEFT JOIN log_jobs j ON i.image_id = j.image_id
-                    LEFT JOIN detections d ON j.job_id = d.job_id
-                    """
-                )
-                stats = cursor.fetchone()
-                
-                # Get component counts
-                cursor.execute(
-                    """
-                    SELECT class_name, COUNT(*) as count
-                    FROM detections
-                    GROUP BY class_name
-                    ORDER BY count DESC
-                    """
-                )
-                component_counts = {row['class_name']: row['count'] for row in cursor.fetchall()}
-                
-                result = dict(stats) if stats else {}
-                result['component_counts'] = component_counts
-                return result
+            stats = _rows(conn.execute(text("""
+                SELECT
+                    COUNT(DISTINCT i.image_id) AS total_images,
+                    COUNT(DISTINCT j.job_id) AS total_jobs,
+                    COUNT(DISTINCT d.detection_id) AS total_detections
+                FROM images_input i
+                LEFT JOIN log_jobs j ON i.image_id = j.image_id
+                LEFT JOIN detections d ON j.job_id = d.job_id
+            """)))
+            counts = conn.execute(text(
+                "SELECT class_name, COUNT(*) AS count FROM detections "
+                "GROUP BY class_name ORDER BY count DESC")).mappings().all()
+        result = stats[0] if stats else {}
+        result["component_counts"] = {r["class_name"]: r["count"] for r in counts}
+        return result
 
     # ------------------------------------------------------------------
     # PCBA Photo Booth logging (log_pcba_pb_import / log_pcba_pb_row_import)
@@ -383,63 +258,36 @@ class DatabaseManager:
         pcba_id: Optional[str] = None,
         org_id: Optional[str] = None,
     ) -> str:
-        """
-        Create a PCBA Photo Booth import session.
-
-        Returns:
-            UUID of the created import record.
-        """
-        import json as _json
-
+        """Create a PCBA Photo Booth import session. Returns its UUID (str)."""
+        import json
+        import_id = str(uuid.uuid4())
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
+            conn.execute(
+                text("""
                     INSERT INTO log_pcba_pb_import
-                        (image_storage_path, detection_config, total_detections,
+                        (id, image_storage_path, detection_config, total_detections,
                          status, user_id, pcba_id, org_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        image_storage_path,
-                        _json.dumps(detection_config) if detection_config else None,
-                        total_detections,
-                        status,
-                        user_id,
-                        pcba_id,
-                        org_id,
-                    ),
-                )
-                return str(cursor.fetchone()[0])
+                    VALUES (:id, :p, :cfg, :t, :s, :u, :pc, :o)
+                """),
+                {"id": import_id, "p": image_storage_path,
+                 "cfg": json.dumps(detection_config) if detection_config else None,
+                 "t": total_detections, "s": status,
+                 "u": user_id, "pc": pcba_id, "o": org_id},
+            )
+        return import_id
 
-    def update_pcba_import_status(
-        self,
-        import_id: str,
-        status: str,
-        total_detections: Optional[int] = None,
-    ) -> None:
-        """Update the status (and optionally total_detections) of a PCBA import."""
+    def update_pcba_import_status(self, import_id: str, status: str,
+                                  total_detections: Optional[int] = None) -> None:
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                if total_detections is not None:
-                    cursor.execute(
-                        """
-                        UPDATE log_pcba_pb_import
-                        SET status = %s, total_detections = %s
-                        WHERE id = %s
-                        """,
-                        (status, total_detections, import_id),
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        UPDATE log_pcba_pb_import
-                        SET status = %s
-                        WHERE id = %s
-                        """,
-                        (status, import_id),
-                    )
+            if total_detections is not None:
+                conn.execute(
+                    text("UPDATE log_pcba_pb_import SET status = :s, total_detections = :t "
+                         "WHERE id = :i"),
+                    {"s": status, "t": total_detections, "i": import_id})
+            else:
+                conn.execute(
+                    text("UPDATE log_pcba_pb_import SET status = :s WHERE id = :i"),
+                    {"s": status, "i": import_id})
 
     def log_pcba_row_import(
         self,
@@ -453,136 +301,92 @@ class DatabaseManager:
         cropped_image_path: Optional[str] = None,
         processing_status: str = "pending",
     ) -> str:
-        """
-        Log a single detected row within a PCBA import session.
-
-        Returns:
-            UUID of the created row record.
-        """
-        import json as _json
-
+        """Log one detected row of a PCBA import. Returns its UUID (str)."""
+        import json
+        row_id = str(uuid.uuid4())
         with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
+            conn.execute(
+                text("""
                     INSERT INTO log_pcba_pb_row_import
-                        (log_pcba_pb_import_id, row_number, detection_type,
+                        (id, log_pcba_pb_import_id, row_number, detection_type,
                          ic_subtype, detection_confidence, ic_confidence,
                          bounding_box, cropped_image_path, processing_status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        import_id,
-                        row_number,
-                        detection_type,
-                        ic_subtype,
-                        detection_confidence,
-                        ic_confidence,
-                        _json.dumps(bounding_box),
-                        cropped_image_path,
-                        processing_status,
-                    ),
-                )
-                return str(cursor.fetchone()[0])
+                    VALUES (:id, :imp, :rn, :dt, :ics, :dc, :icc, :bb, :cp, :ps)
+                """),
+                {"id": row_id, "imp": import_id, "rn": row_number, "dt": detection_type,
+                 "ics": ic_subtype, "dc": detection_confidence, "icc": ic_confidence,
+                 "bb": json.dumps(bounding_box), "cp": cropped_image_path,
+                 "ps": processing_status},
+            )
+        return row_id
+
+    @staticmethod
+    def _decode_json(rows: List[Dict[str, Any]], *keys: str) -> List[Dict[str, Any]]:
+        import json
+        for row in rows:
+            for k in keys:
+                if isinstance(row.get(k), str):
+                    try:
+                        row[k] = json.loads(row[k])
+                    except ValueError:
+                        pass
+        return rows
 
     def get_all_pcba_imports(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Return recent PCBA Photo Booth import sessions."""
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        p.*,
-                        COUNT(r.id) AS row_count
+            rows = _rows(conn.execute(
+                text("""
+                    SELECT p.*, COUNT(r.id) AS row_count
                     FROM log_pcba_pb_import p
-                    LEFT JOIN log_pcba_pb_row_import r
-                        ON r.log_pcba_pb_import_id = p.id
+                    LEFT JOIN log_pcba_pb_row_import r ON r.log_pcba_pb_import_id = p.id
                     GROUP BY p.id
-                    ORDER BY p.created_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-                return [dict(row) for row in cursor.fetchall()]
+                    ORDER BY p.created_at DESC, p.rowid DESC
+                    LIMIT :l
+                """), {"l": limit}))
+        return self._decode_json(rows, "detection_config")
 
-    def get_pcba_import_rows(
-        self, import_id: str, limit: int = 500
-    ) -> List[Dict[str, Any]]:
-        """Return all detection rows for a given PCBA import session."""
+    def get_pcba_import_rows(self, import_id: str, limit: int = 500) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT * FROM log_pcba_pb_row_import
-                    WHERE log_pcba_pb_import_id = %s
-                    ORDER BY row_number
-                    LIMIT %s
-                    """,
-                    (import_id, limit),
-                )
-                return [dict(row) for row in cursor.fetchall()]
+            rows = _rows(conn.execute(
+                text("SELECT * FROM log_pcba_pb_row_import "
+                     "WHERE log_pcba_pb_import_id = :i ORDER BY row_number LIMIT :l"),
+                {"i": import_id, "l": limit}))
+        return self._decode_json(rows, "bounding_box")
+
+    def get_all_pcba_rows(self, limit: int = 200) -> List[Dict[str, Any]]:
+        with self.get_connection() as conn:
+            rows = _rows(conn.execute(
+                text("SELECT * FROM log_pcba_pb_row_import "
+                     "ORDER BY created_at DESC, rowid DESC LIMIT :l"), {"l": limit}))
+        return self._decode_json(rows, "bounding_box")
 
     def get_pcba_statistics(self) -> Dict[str, Any]:
-        """Return aggregate statistics from PCBA Photo Booth tables."""
+        """Aggregate statistics from PCBA Photo Booth tables."""
         with self.get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        COUNT(DISTINCT p.id)  AS total_imports,
-                        COALESCE(SUM(p.total_detections), 0) AS total_detections,
-                        COUNT(DISTINCT CASE WHEN p.status = 'completed' THEN p.id END) AS completed,
-                        COUNT(DISTINCT CASE WHEN p.status = 'error' THEN p.id END)     AS errors
-                    FROM log_pcba_pb_import p
-                    """
-                )
-                stats = dict(cursor.fetchone() or {})
-
-                cursor.execute(
-                    """
-                    SELECT detection_type, COUNT(*) AS count
-                    FROM log_pcba_pb_row_import
-                    GROUP BY detection_type
-                    ORDER BY count DESC
-                    """
-                )
-                stats["component_counts"] = {
-                    row["detection_type"]: row["count"]
-                    for row in cursor.fetchall()
-                }
-                return stats
+            stats = _rows(conn.execute(text("""
+                SELECT
+                    COUNT(DISTINCT p.id) AS total_imports,
+                    COALESCE(SUM(p.total_detections), 0) AS total_detections,
+                    COUNT(DISTINCT CASE WHEN p.status = 'completed' THEN p.id END) AS completed,
+                    COUNT(DISTINCT CASE WHEN p.status = 'error' THEN p.id END) AS errors
+                FROM log_pcba_pb_import p
+            """)))
+            counts = conn.execute(text(
+                "SELECT detection_type, COUNT(*) AS count FROM log_pcba_pb_row_import "
+                "GROUP BY detection_type ORDER BY count DESC")).mappings().all()
+        result = stats[0] if stats else {}
+        result["component_counts"] = {r["detection_type"]: r["count"] for r in counts}
+        return result
 
 
 def get_db_manager_from_env() -> DatabaseManager:
     """
-    Create a DatabaseManager using environment variables.
+    Create a DatabaseManager on the local SQLite database.
 
-    Loads configuration from a .env file if present (using python-dotenv).
-    If no .env file is found, falls back to environment variables or defaults
-    and prints a notice.
-
-    Environment variables:
-        DB_HOST: Database host (default: localhost)
-        DB_PORT: Database port (default: 5432)
-        DB_NAME: Database name (default: nuts_vision)
-        DB_USER: Database user (default: nuts_user)
-        DB_PASSWORD: Database password (default: nuts_password)
-
-    Returns:
-        DatabaseManager instance
+    The location comes from the paths configuration (src/config.py):
+    NUTS_VISION_DATA_DIR overrides the default
+    %LOCALAPPDATA%\\DataPeanuts\\NutsVision\\database\\nuts_vision.sqlite3.
     """
-    from dotenv import load_dotenv, find_dotenv
-    env_file = find_dotenv(usecwd=True)
-    if env_file:
-        load_dotenv(env_file)
-    else:
-        print("No .env file found, using defaults")
-
-    return DatabaseManager(
-        host=os.getenv('DB_HOST', 'localhost'),
-        port=int(os.getenv('DB_PORT', '5432')),
-        database=os.getenv('DB_NAME', 'nuts_vision'),
-        user=os.getenv('DB_USER', 'nuts_user'),
-        password=os.getenv('DB_PASSWORD', 'nuts_password')
-    )
+    paths = get_paths()
+    paths.ensure_dirs()
+    return DatabaseManager(paths.database_path)
