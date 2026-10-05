@@ -104,23 +104,38 @@ class DatabaseManager:
         job_name: str = None,
         job_folder_path: str = None,
         model_version: str = None,
+        source_path: str = None,
     ) -> int:
-        """Start a detection job (status 'running'). Returns job_id."""
+        """Start a detection job (status 'processing'). Returns job_id."""
         with self.get_connection() as conn:
             res = conn.execute(
-                text("INSERT INTO log_jobs (image_id, model, model_version, job_name, "
-                     "job_folder_path, status) "
-                     "VALUES (:i, :m, :mv, :jn, :jp, 'running')"),
+                text("INSERT INTO analyses (image_id, model, model_version, job_name, "
+                     "job_folder_path, source_path, status) "
+                     "VALUES (:i, :m, :mv, :jn, :jp, :sp, 'processing')"),
                 {"i": image_id, "m": model, "mv": model_version,
-                 "jn": job_name, "jp": job_folder_path},
+                 "jn": job_name, "jp": job_folder_path, "sp": source_path},
             )
             return int(res.lastrowid)
 
-    def end_job(self, job_id: int, status: str = "completed", error_message: str = None):
-        """Mark a job as ended ('completed' or 'error')."""
+    def set_job_files(self, job_id: int, job_name: str = None, job_folder_path: str = None,
+                      input_copy_path: str = None, result_image_path: str = None,
+                      metadata_path: str = None):
+        """Record the files written for an analysis (images stay on disk)."""
         with self.get_connection() as conn:
             conn.execute(
-                text("UPDATE log_jobs SET ended_at = CURRENT_TIMESTAMP, status = :s, "
+                text("UPDATE analyses SET job_name = :n, job_folder_path = :f, "
+                     "input_copy_path = :i, result_image_path = :r, "
+                     "metadata_path = :m WHERE job_id = :j"),
+                {"n": job_name, "f": job_folder_path, "i": input_copy_path, "r": result_image_path, "m": metadata_path, "j": job_id},
+            )
+
+    def end_job(self, job_id: int, status: str = "completed", error_message: str = None):
+        """Mark a job as ended ('completed' or 'error')."""
+        if status not in ("completed", "error"):
+            raise ValueError("status must be 'completed' or 'error'")
+        with self.get_connection() as conn:
+            conn.execute(
+                text("UPDATE analyses SET ended_at = CURRENT_TIMESTAMP, status = :s, "
                      "error_message = :e WHERE job_id = :j"),
                 {"s": status, "e": error_message, "j": job_id},
             )
@@ -144,7 +159,7 @@ class DatabaseManager:
         """Log a cropped component image. Returns cropped_id."""
         with self.get_connection() as conn:
             res = conn.execute(
-                text("INSERT INTO ics_cropped (job_id, detection_id, cropped_file_path) "
+                text("INSERT INTO crops (job_id, detection_id, cropped_file_path) "
                      "VALUES (:j, :d, :p)"),
                 {"j": job_id, "d": detection_id, "p": cropped_file_path},
             )
@@ -158,10 +173,10 @@ class DatabaseManager:
                     SELECT j.*, i.file_name, i.file_path,
                         COUNT(DISTINCT d.detection_id) AS total_detections,
                         COUNT(DISTINCT ic.cropped_id) AS total_crops
-                    FROM log_jobs j
+                    FROM analyses j
                     JOIN images_input i ON j.image_id = i.image_id
                     LEFT JOIN detections d ON j.job_id = d.job_id
-                    LEFT JOIN ics_cropped ic ON j.job_id = ic.job_id
+                    LEFT JOIN crops ic ON j.job_id = ic.job_id
                     WHERE j.job_id = :j
                     GROUP BY j.job_id, i.file_name, i.file_path
                 """),
@@ -193,7 +208,7 @@ class DatabaseManager:
                 text("""
                     SELECT j.*, i.file_name, i.file_path, i.format,
                         COUNT(DISTINCT d.detection_id) AS detection_count
-                    FROM log_jobs j
+                    FROM analyses j
                     JOIN images_input i ON j.image_id = i.image_id
                     LEFT JOIN detections d ON j.job_id = d.job_id
                     GROUP BY j.job_id, i.file_name, i.file_path, i.format
@@ -219,9 +234,9 @@ class DatabaseManager:
             return _rows(conn.execute(
                 text("""
                     SELECT ic.*, d.class_name, j.job_name
-                    FROM ics_cropped ic
+                    FROM crops ic
                     JOIN detections d ON ic.detection_id = d.detection_id
-                    JOIN log_jobs j ON ic.job_id = j.job_id
+                    JOIN analyses j ON ic.job_id = j.job_id
                     ORDER BY ic.created_at DESC, ic.cropped_id DESC LIMIT :l
                 """), {"l": limit}))
 
@@ -234,7 +249,7 @@ class DatabaseManager:
                     COUNT(DISTINCT j.job_id) AS total_jobs,
                     COUNT(DISTINCT d.detection_id) AS total_detections
                 FROM images_input i
-                LEFT JOIN log_jobs j ON i.image_id = j.image_id
+                LEFT JOIN analyses j ON i.image_id = j.image_id
                 LEFT JOIN detections d ON j.job_id = d.job_id
             """)))
             counts = conn.execute(text(

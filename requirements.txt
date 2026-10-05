@@ -3,6 +3,10 @@ ultralytics>=8.0.0
 torch>=2.0.0
 torchvision>=0.15.0
 
+# ONNX runtime (CPU) - installed up front so Ultralytics never auto-installs them during analysis
+onnx>=1.16.0
+onnxruntime>=1.18.0
+
 # Image Processing
 opencv-python>=4.8.0
 Pillow>=10.0.0

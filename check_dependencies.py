@@ -17,7 +17,9 @@ def check_python_packages():
         'matplotlib',
         'seaborn',
         'PIL',
-        'yaml'
+        'yaml',
+        'onnx',
+        'onnxruntime'
     ]
 
     web_packages = [
