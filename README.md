@@ -9,7 +9,7 @@ Automated electronic component detector for circuit boards — upload a photo of
 3. **IC sub-classification** — the `ic_detect` model classifies ICs by pin layout (`four_side`, `two_side`, `without_side`).
 4. **Crop** — each detected component is saved as a separate image.
 5. **Browse** — every analysis is stored as a *job* (its own folder) that you can review in the **Job Viewer** page.
-6. **Log** *(optional)* — all results can be stored in a PostgreSQL database for later querying and statistics.
+6. **Log** *(optional)* — all results are stored in a local SQLite database for later querying and statistics.
 
 ### Detected component classes (13)
 
@@ -27,7 +27,7 @@ nuts_vision/
 ├── ic_detect_best.onnx     # IC sub-classification model (four_side, two_side, without_side)
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Example environment variables
-├── docker-compose.yml      # PostgreSQL container (optional)
+├── docker-compose.yml      # Legacy (PostgreSQL), unused
 ├── start_web.sh / .bat     # Convenience launchers
 ├── check_dependencies.py   # Dependency checker
 ├── example.py              # Python usage examples
@@ -37,7 +37,7 @@ nuts_vision/
 │   ├── detect.py           # Component detector + DualModelDetector (YOLOv8 wrapper)
 │   ├── crop.py             # Component cropper
 │   ├── visualize.py        # Visualization utilities
-│   └── database.py         # PostgreSQL logging (optional)
+│   └── database.py         # SQLite logging
 └── database/
     └── init.sql            # Database schema
 ```
@@ -73,7 +73,7 @@ jobs/
 
 ## Installation
 
-**Requirements:** Python 3.8+, Docker (optional, for the database).
+**Requirements:** Python 3.8+.
 
 ```bash
 # Install Python dependencies
@@ -102,7 +102,7 @@ Open your browser at **http://localhost:8501**.
 | 🏠 Home | Overview and quick statistics |
 | 📤 Upload & Process | Upload PCB images and run the detection pipeline |
 | 🔍 Job Viewer | Browse per-job results: input photo, annotated result, crops, metadata |
-| 🗄️ Database Viewer | Browse the PostgreSQL database tables (requires DB) |
+| 🗄️ Database Viewer | Browse the local SQLite database tables |
 | 📊 Statistics | IC counts and job history charts (requires DB) |
 | ℹ️ About | Version and environment info |
 
@@ -123,43 +123,23 @@ python src/pipeline.py --model smd_comp.pt --image path/to/board.jpg --use-datab
 
 ---
 
-## Optional: PostgreSQL database
+## Local storage (SQLite)
 
-The database is entirely optional. Without it, all results are still saved to the `jobs/` folder.
+Nuts Vision is self-contained: no Docker, PostgreSQL or network configuration is needed.
+On first launch the folders and the SQLite database are created automatically (schema managed by Alembic,
+upgraded at each start, never reset).
 
-### Full Docker deployment (app + database)
+| Data | Default location (Windows) |
+|------|----------------------------|
+| Database & logs | `%LOCALAPPDATA%\DataPeanuts\NutsVision\` (`database\nuts_vision.sqlite3`, `logs\`) |
+| Images & results | `<Pictures folder>\NutsVision\` (`jobs\`, `imports\`) |
 
-```bash
-# Start everything with Docker (app on port 8501 + PostgreSQL)
-docker-compose up -d
-```
+Override with `NUTS_VISION_DATA_DIR` / `NUTS_VISION_OUTPUT_DIR` (see `.env.example`); the results folder can also
+be changed from the sidebar **Storage** panel. An **Open analysis folder** button in the Job Viewer opens an analysis in the file explorer.
+The history persists across restarts.
 
-Open your browser at **http://localhost:8501**.
-
-The `web` service automatically sets `DB_HOST=postgres` so it connects to the database container.
-
-### Local app + Docker database
-
-```bash
-# Start only the database container
-docker-compose up -d postgres
-
-# Copy and edit the environment file
-cp .env.example .env   # keep DB_HOST=localhost for local app
-
-# Launch the app locally
-streamlit run app.py
-```
-
-The `.env` variables used:
-
-| Variable | Default | Docker value |
-|----------|---------|-------------|
-| `DB_HOST` | `localhost` | `postgres` |
-| `DB_PORT` | `5432` | `5432` |
-| `DB_NAME` | `nuts_vision` | `nuts_vision` |
-| `DB_USER` | `nuts_user` | `nuts_user` |
-| `DB_PASSWORD` | `nuts_password` | `nuts_password` |
+> `docker-compose.yml` and `database/*.sql` are legacy PostgreSQL files, kept untouched and no longer used by the app.
+> No data is migrated from the old PostgreSQL storage.
 
 ---
 

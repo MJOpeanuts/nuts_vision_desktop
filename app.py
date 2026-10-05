@@ -25,9 +25,9 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 # Import modules
 try:
+    from config import get_paths, open_folder
     from database import get_db_manager_from_env
     from pipeline import ComponentAnalysisPipeline
-    from psycopg2.extras import RealDictCursor
     DB_AVAILABLE = True
 except ImportError as e:
     st.error(f"Error importing modules: {e}")
@@ -89,10 +89,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Local storage: output folder is selectable (sidebar), data folder is technical
+if DB_AVAILABLE:
+    if "output_dir" not in st.session_state:
+        st.session_state.output_dir = str(get_paths().output_dir)
+    APP_PATHS = get_paths(st.session_state.output_dir)
+    JOBS_DIR = APP_PATHS.jobs_dir
+    try:
+        APP_PATHS.ensure_dirs()
+    except OSError as e:
+        st.error(f"Cannot create the data folders: {e}")
+
+
+@st.cache_resource
+def _get_db():
+    """One DatabaseManager per server process (schema init is rerun-safe)."""
+    return get_db_manager_from_env()
+
+
 # Initialize session state
 if DB_AVAILABLE and not st.session_state.get("db_connected", False):
     try:
-        st.session_state.db = get_db_manager_from_env()
+        st.session_state.db = _get_db()
         st.session_state.db_connected = st.session_state.db.test_connection()
         if st.session_state.db_connected and "db_error" in st.session_state:
             del st.session_state.db_error
@@ -115,9 +133,9 @@ page = st.sidebar.radio(
 st.sidebar.markdown("---")
 if DB_AVAILABLE:
     if st.session_state.get("db_connected", False):
-        st.sidebar.success("\u2705 Database Connected")
+        st.sidebar.success("\u2705 Local database ready")
     else:
-        st.sidebar.warning("\u26a0\ufe0f Database Disconnected")
+        st.sidebar.warning("\u26a0\ufe0f Local database unavailable")
         if "db_error" in st.session_state:
             st.sidebar.text(f"Error: {st.session_state.db_error}")
         if st.sidebar.button("\U0001f504 Retry Connection"):
@@ -127,6 +145,17 @@ if DB_AVAILABLE:
             st.rerun()
 else:
     st.sidebar.warning("\u26a0\ufe0f Database Module Not Available")
+
+if DB_AVAILABLE:
+    with st.sidebar.expander("\U0001f4c2 Storage"):
+        new_out = st.text_input("Images & results folder", value=st.session_state.output_dir)
+        if new_out and new_out != st.session_state.output_dir:
+            st.session_state.output_dir = new_out
+            st.rerun()
+        st.caption(f"Database: {APP_PATHS.database_path}")
+        if st.button("Open results folder"):
+            if not open_folder(JOBS_DIR):
+                st.warning(f"Cannot open: {JOBS_DIR}")
 
 
 # ========== HOME PAGE ==========
@@ -154,7 +183,7 @@ if page == "\U0001f3e0 Home":
     st.markdown("""
     #### \U0001f4c1 Output structure (per job):
     ```
-    jobs/
+    <output folder>/jobs/
       <image_name>_<date>_<time>/
         input.<ext>    — original photo
         result.jpg     — annotated photo with bounding boxes
@@ -243,7 +272,7 @@ elif page == "\U0001f4e4 Upload & Process":
         if not Path(model_path).exists():
             st.error(f"Model file not found: {model_path}")
         else:
-            upload_dir = Path("jobs") / "_uploads"
+            upload_dir = APP_PATHS.uploads_dir
             upload_dir.mkdir(parents=True, exist_ok=True)
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -263,7 +292,7 @@ elif page == "\U0001f4e4 Upload & Process":
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
                     try:
-                        result = pipeline.process_image(str(file_path.resolve()), jobs_base_dir="jobs")
+                        result = pipeline.process_image(str(file_path.resolve()), jobs_base_dir=str(JOBS_DIR))
                         # Apply optional class filter on the metadata
                         dets = result["metadata"]["total_detections"]
                         if selected_classes:
@@ -673,7 +702,7 @@ elif page == "\U0001f4f7 PCBA Photo Booth":
                 for c in (job_name_input or "photobooth").strip()
             ).strip("._-") or "photobooth"
             job_folder_name = f"{sanitized_job_name}_{now.strftime('%Y%m%d_%H%M%S')}"
-            jobs_base = Path("jobs").resolve()
+            jobs_base = JOBS_DIR.resolve()
             job_dir = jobs_base / job_folder_name
             # Guard against path traversal
             if not job_dir.resolve().is_relative_to(jobs_base):
@@ -810,7 +839,7 @@ elif page == "\U0001f50d Job Viewer":
     st.markdown('<div class="main-header">\U0001f50d Job Viewer</div>', unsafe_allow_html=True)
     st.markdown("Browse results: input photo, annotated result, cropped components, and metadata.")
 
-    jobs_base = Path("jobs")
+    jobs_base = JOBS_DIR
     job_folders = sorted(
         [d for d in jobs_base.iterdir() if d.is_dir() and (d / "metadata.json").exists()],
         key=lambda d: d.stat().st_mtime, reverse=True
@@ -847,6 +876,10 @@ elif page == "\U0001f50d Job Viewer":
 
                 st.markdown("---")
                 st.markdown("### \U0001f4cb Job Information")
+                st.caption(f"\U0001f4c1 {job_dir}")
+                if st.button("\U0001f4c2 Open analysis folder", key="open_job_dir"):
+                    if not open_folder(job_dir):
+                        st.warning(f"Cannot open: {job_dir}")
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Job Name", metadata.get("job_name", "—"))
@@ -936,14 +969,8 @@ elif page == "\U0001f5c4\ufe0f Database Viewer":
     st.markdown('<div class="main-header">\U0001f5c4\ufe0f Database Viewer</div>', unsafe_allow_html=True)
 
     if not st.session_state.get("db_connected", False):
-        st.error("""
-        \u274c **Database not connected!**
-        Start PostgreSQL:
-        ```bash
-        docker-compose up -d
-        ```
-        Environment variables: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-        """)
+        st.error("\u274c **Local database unavailable.** Restart the application; "
+                 "see the logs folder if the problem persists.")
     else:
         table_view = st.selectbox("Select Table",
             ["\U0001f4f8 Images Input", "\U0001f504 Jobs Log",
@@ -1006,17 +1033,7 @@ elif page == "\U0001f5c4\ufe0f Database Viewer":
                     st.info("No detections in database yet.")
 
             elif table_view == "\u2702\ufe0f Cropped Components":
-                with st.session_state.db.get_connection() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            SELECT ic.*, d.class_name, j.job_id, j.job_name
-                            FROM ics_cropped ic
-                            JOIN detections d ON ic.detection_id = d.detection_id
-                            JOIN log_jobs j ON ic.job_id = j.job_id
-                            ORDER BY ic.created_at DESC LIMIT 100
-                        """)
-                        columns = [desc[0] for desc in cursor.description]
-                        data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                data = st.session_state.db.get_all_cropped_components()
                 if data:
                     df = pd.DataFrame(data)
                     if "created_at" in df.columns:
@@ -1061,12 +1078,7 @@ elif page == "\U0001f5c4\ufe0f Database Viewer":
                 ]
                 selected = st.selectbox("Filter by import session", import_options)
                 if selected == "All Imports":
-                    with st.session_state.db.get_connection() as conn:
-                        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                            cursor.execute(
-                                "SELECT * FROM log_pcba_pb_row_import ORDER BY created_at DESC LIMIT 200"
-                            )
-                            data = [dict(row) for row in cursor.fetchall()]
+                    data = st.session_state.db.get_all_pcba_rows()
                 else:
                     imp_id = selected.split(" — ")[0]
                     data = st.session_state.db.get_pcba_import_rows(imp_id)
@@ -1093,7 +1105,7 @@ elif page == "\U0001f4ca Statistics":
     st.markdown('<div class="main-header">\U0001f4ca Statistics & Analytics</div>', unsafe_allow_html=True)
 
     if not st.session_state.get("db_connected", False):
-        st.warning("Database not connected. Statistics require database access.")
+        st.warning("Local database unavailable. Statistics require database access.")
     else:
         try:
             stats = st.session_state.db.get_detection_statistics()
@@ -1183,13 +1195,13 @@ elif page == "\u2139\ufe0f About":
 
     #### 🛠️ Key Technologies:
     - **YOLOv8**: component detection (ONNX & PyTorch models)
-    - **PostgreSQL** *(optional)*: logging & audit trail
+    - **SQLite** (local): analysis history
     - **Streamlit**: web interface
     - **OpenCV**: image processing & cropping
 
     #### 📁 Job Folder Structure:
     ```
-    jobs/
+    <output folder>/jobs/
       <image_name>_<YYYYMMDD>_<HHMMSS>/
         input.<ext>    — original photo
         result.jpg     — annotated photo
@@ -1205,10 +1217,9 @@ elif page == "\u2139\ufe0f About":
     with col1:
         st.markdown("**Database Status:**")
         if st.session_state.get("db_connected", False):
-            st.success("\u2705 Connected")
-            st.text(f"Host: {os.getenv('DB_HOST', 'localhost')}")
-            st.text(f"Port: {os.getenv('DB_PORT', '5432')}")
-            st.text(f"Database: {os.getenv('DB_NAME', 'nuts_vision')}")
+            st.success("\u2705 Local SQLite database")
+            st.text(f"File: {APP_PATHS.database_path}")
+            st.text(f"Results: {JOBS_DIR}")
         else:
             st.error("\u274c Not Connected")
     with col2:

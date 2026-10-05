@@ -6,21 +6,6 @@ echo "nuts_vision - Web Interface Launcher"
 echo "=========================================="
 echo ""
 
-# Check if PostgreSQL is running (if using Docker)
-if command -v docker-compose &> /dev/null; then
-    echo "Checking PostgreSQL database..."
-    if docker-compose ps | grep -q "nuts_vision_db"; then
-        echo "✅ Database container is running"
-    else
-        echo "⚠️  Database container not running"
-        echo "Starting database with docker-compose..."
-        docker-compose up -d
-        echo "Waiting for database to be ready..."
-        sleep 5
-    fi
-    echo ""
-fi
-
 # Check if virtual environment exists
 if [ ! -d "venv" ]; then
     echo "⚠️  Virtual environment not found"
